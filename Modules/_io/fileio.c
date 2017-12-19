@@ -1,6 +1,7 @@
 /* Author: Daniel Stutzbach */
 
 #define PY_SSIZE_T_CLEAN
+#define Py_BUILD_CORE 
 #include "Python.h"
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
@@ -70,8 +71,6 @@ _PyFileIO_closed(PyObject *self)
 static PyObject *
 portable_lseek(int fd, PyObject *posobj, int whence);
 
-static PyObject *portable_lseek(int fd, PyObject *posobj, int whence);
-
 /* Returns 0 on success, -1 with exception set on failure. */
 static int
 internal_close(fileio *self)
@@ -84,7 +83,10 @@ internal_close(fileio *self)
         /* fd is accessible and someone else may have closed it */
         if (_PyVerify_fd(fd)) {
             Py_BEGIN_ALLOW_THREADS
+            _Py_BEGIN_SUPPRESS_IPH
+            errno = 0;
             err = close(fd);
+            _Py_END_SUPPRESS_IPH
             if (err < 0)
                 save_errno = errno;
             Py_END_ALLOW_THREADS
@@ -151,7 +153,10 @@ dircheck(fileio* self, PyObject *nameobj)
         return 0;
 
     Py_BEGIN_ALLOW_THREADS
+    _Py_BEGIN_SUPPRESS_IPH
+    errno = 0;
     res = fstat(self->fd, &buf);
+    _Py_END_SUPPRESS_IPH
     Py_END_ALLOW_THREADS
 
     if (res == 0 && S_ISDIR(buf.st_mode)) {
@@ -171,8 +176,14 @@ check_fd(int fd)
     int res;
     PyObject *exc;
     char *msg;
+    int is_bad_fd;
 
-    if (!_PyVerify_fd(fd)) {
+    _Py_BEGIN_SUPPRESS_IPH
+    errno = 0;
+    is_bad_fd = !_PyVerify_fd(fd);
+    _Py_END_SUPPRESS_IPH
+    
+    if (is_bad_fd) {
         goto badfd;
     }
 
@@ -367,6 +378,7 @@ fileio_init(PyObject *oself, PyObject *args, PyObject *kwds)
         }
 
         Py_BEGIN_ALLOW_THREADS
+        _Py_BEGIN_SUPPRESS_IPH
         errno = 0;
 #ifdef MS_WINDOWS
         if (widename != NULL)
@@ -374,6 +386,7 @@ fileio_init(PyObject *oself, PyObject *args, PyObject *kwds)
         else
 #endif
             self->fd = open(name, flags, 0666);
+        _Py_END_SUPPRESS_IPH
         Py_END_ALLOW_THREADS
         fd_is_own = 1;
         if (self->fd < 0) {
@@ -514,6 +527,7 @@ fileio_readinto(fileio *self, PyObject *args)
     if (_PyVerify_fd(self->fd)) {
         len = pbuf.len;
         Py_BEGIN_ALLOW_THREADS
+        _Py_BEGIN_SUPPRESS_IPH
         errno = 0;
 #if defined(MS_WIN64) || defined(MS_WINDOWS)
         if (len > INT_MAX)
@@ -522,6 +536,7 @@ fileio_readinto(fileio *self, PyObject *args)
 #else
         n = read(self->fd, pbuf.buf, len);
 #endif
+        _Py_END_SUPPRESS_IPH
         Py_END_ALLOW_THREADS
     } else
         n = -1;
@@ -545,14 +560,20 @@ new_buffersize(fileio *self, size_t currentsize)
     int res;
 
     Py_BEGIN_ALLOW_THREADS
+    _Py_BEGIN_SUPPRESS_IPH
+    errno = 0;
     res = fstat(self->fd, &st);
+    _Py_END_SUPPRESS_IPH
     Py_END_ALLOW_THREADS
 
     if (res == 0) {
         end = st.st_size;
 
         Py_BEGIN_ALLOW_THREADS
+        _Py_BEGIN_SUPPRESS_IPH
+        errno = 0;
         pos = lseek(self->fd, 0L, SEEK_CUR);
+        _Py_END_SUPPRESS_IPH
         Py_END_ALLOW_THREADS
 
         /* Files claiming a size smaller than SMALLCHUNK may
@@ -602,6 +623,7 @@ fileio_readall(fileio *self)
                 return NULL; /* result has been freed */
         }
         Py_BEGIN_ALLOW_THREADS
+        _Py_BEGIN_SUPPRESS_IPH
         errno = 0;
         n = newsize - total;
 #if defined(MS_WIN64) || defined(MS_WINDOWS)
@@ -615,6 +637,7 @@ fileio_readall(fileio *self)
                  PyBytes_AS_STRING(result) + total,
                  n);
 #endif
+        _Py_END_SUPPRESS_IPH
         Py_END_ALLOW_THREADS
         if (n == 0)
             break;
@@ -679,12 +702,14 @@ fileio_read(fileio *self, PyObject *args)
 
     if (_PyVerify_fd(self->fd)) {
         Py_BEGIN_ALLOW_THREADS
+        _Py_BEGIN_SUPPRESS_IPH
         errno = 0;
 #if defined(MS_WIN64) || defined(MS_WINDOWS)
         n = read(self->fd, ptr, (int)size);
 #else
         n = read(self->fd, ptr, size);
 #endif
+        _Py_END_SUPPRESS_IPH
         Py_END_ALLOW_THREADS
     } else
         n = -1;
@@ -721,6 +746,7 @@ fileio_write(fileio *self, PyObject *args)
 
     if (_PyVerify_fd(self->fd)) {
         Py_BEGIN_ALLOW_THREADS
+        _Py_BEGIN_SUPPRESS_IPH
         errno = 0;
         len = pbuf.len;
 #if defined(MS_WIN64) || defined(MS_WINDOWS)
@@ -730,6 +756,7 @@ fileio_write(fileio *self, PyObject *args)
 #else
         n = write(self->fd, pbuf.buf, len);
 #endif
+        _Py_END_SUPPRESS_IPH
         Py_END_ALLOW_THREADS
     } else
         n = -1;
@@ -787,11 +814,14 @@ portable_lseek(int fd, PyObject *posobj, int whence)
 
     if (_PyVerify_fd(fd)) {
         Py_BEGIN_ALLOW_THREADS
+        _Py_BEGIN_SUPPRESS_IPH
+        errno = 0;
 #if defined(MS_WIN64) || defined(MS_WINDOWS)
         res = _lseeki64(fd, pos, whence);
 #else
         res = lseek(fd, pos, whence);
 #endif
+        _Py_END_SUPPRESS_IPH
         Py_END_ALLOW_THREADS
     } else
         res = -1;
@@ -884,6 +914,7 @@ fileio_truncate(fileio *self, PyObject *args)
 
         /* Truncate.  Note that this may grow the file! */
         Py_BEGIN_ALLOW_THREADS
+        _Py_BEGIN_SUPPRESS_IPH
         errno = 0;
         hFile = (HANDLE)_get_osfhandle(fd);
         ret = hFile == (HANDLE)-1; /* testing for INVALID_HANDLE value */
@@ -892,6 +923,7 @@ fileio_truncate(fileio *self, PyObject *args)
             if (ret)
                 errno = EACCES;
         }
+        _Py_END_SUPPRESS_IPH
         Py_END_ALLOW_THREADS
 
         /* we restore the file pointer position in any case */
