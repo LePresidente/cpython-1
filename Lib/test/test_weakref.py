@@ -12,6 +12,10 @@ from test import test_support
 
 # Used in ReferencesTestCase.test_ref_created_during_del() .
 ref_from_del = None
+# collect_in_thread tests are really slow on vs 2015, presumably because
+# gc is slow? Need to investigate this in more detail in the future.
+count_multiplier = 1 if test_support.universal_crt else 1000
+
 
 class C:
     def method(self):
@@ -1425,7 +1429,7 @@ class MappingTestCase(TestBase):
     def test_threaded_weak_valued_setdefault(self):
         d = weakref.WeakValueDictionary()
         with collect_in_thread():
-            for i in range(50000):
+            for i in range(50 * count_multiplier):
                 x = d.setdefault(10, RefCycle())
                 self.assertIsNot(x, None)  # we never put None in there!
                 del x
@@ -1433,7 +1437,7 @@ class MappingTestCase(TestBase):
     def test_threaded_weak_valued_pop(self):
         d = weakref.WeakValueDictionary()
         with collect_in_thread():
-            for i in range(50000):
+            for i in range(50 * count_multiplier):
                 d[10] = RefCycle()
                 x = d.pop(10, 10)
                 self.assertIsNot(x, None)  # we never put None in there!
@@ -1443,7 +1447,7 @@ class MappingTestCase(TestBase):
         # WeakValueDictionary when collecting from another thread.
         d = weakref.WeakValueDictionary()
         with collect_in_thread():
-            for i in range(200000):
+            for i in range(200 * count_multiplier):
                 o = RefCycle()
                 d[10] = o
                 # o is still alive, so the dict can't be empty

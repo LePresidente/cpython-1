@@ -34,7 +34,7 @@ __all__ = ["Error", "TestFailed", "ResourceDenied", "import_module",
            "get_original_stdout", "unload", "unlink", "rmtree", "forget",
            "is_resource_enabled", "requires", "requires_mac_ver",
            "find_unused_port", "bind_port",
-           "fcmp", "have_unicode", "is_jython", "TESTFN", "HOST", "FUZZ",
+           "fcmp", "have_unicode", "universal_crt", "is_jython", "TESTFN", "HOST", "FUZZ",
            "SAVEDCWD", "temp_cwd", "findfile", "sortdict", "check_syntax_error",
            "open_urlresource", "check_warnings", "check_py3k_warnings",
            "CleanImport", "EnvironmentVarGuard", "captured_output",
@@ -179,7 +179,6 @@ max_memuse = 0           # Disable bigmem tests (they will still be run with
                          # small sizes, to make sure they work.)
 real_max_memuse = 0
 failfast = False
-match_tests = None
 
 # _original_stdout is meant to hold stdout at the time regrtest began.
 # This may be "the real" stdout, or IDLE's emulation of stdout, or whatever.
@@ -604,6 +603,11 @@ PIPE_MAX_SIZE = 4 * 1024 * 1024 + 1
 # for a discussion of this number).
 SOCK_MAX_SIZE = 16 * 1024 * 1024 + 1
 
+universal_crt = False
+if os.name == 'nt':
+    from distutils.msvccompiler import get_build_version
+    universal_crt = get_build_version() >= 14.0
+
 is_jython = sys.platform.startswith('java')
 
 try:
@@ -848,8 +852,8 @@ def make_bad_fd():
         file.close()
         unlink(TESTFN)
 
-def check_syntax_error(testcase, statement, lineno=None, offset=None):
-    with testcase.assertRaises(SyntaxError) as cm:
+def check_syntax_error(testcase, statement, errtext='', lineno=None, offset=None):
+    with testcase.assertRaisesRegexp(SyntaxError, errtext) as cm:
         compile(statement, '<test string>', 'exec')
     err = cm.exception
     if lineno is not None:
@@ -1542,21 +1546,67 @@ def _run_suite(suite):
         raise TestFailed(err)
 
 
-def _match_test(test):
-    global match_tests
+# By default, don't filter tests
+_match_test_func = None
+_match_test_patterns = None
 
-    if match_tests is None:
+
+def match_test(test):
+    # Function used by support.run_unittest() and regrtest --list-cases
+    if _match_test_func is None:
         return True
-    test_id = test.id()
+    else:
+        return _match_test_func(test.id())
 
-    for match_test in match_tests:
-        if fnmatch.fnmatchcase(test_id, match_test):
-            return True
 
-        for name in test_id.split("."):
-            if fnmatch.fnmatchcase(name, match_test):
+def _is_full_match_test(pattern):
+    # If a pattern contains at least one dot, it's considered
+    # as a full test identifier.
+    # Example: 'test.test_os.FileTests.test_access'.
+    #
+    # Reject patterns which contain fnmatch patterns: '*', '?', '[...]'
+    # or '[!...]'. For example, reject 'test_access*'.
+    return ('.' in pattern) and (not re.search(r'[?*\[\]]', pattern))
+
+
+def set_match_tests(patterns):
+    global _match_test_func, _match_test_patterns
+
+    if patterns == _match_test_patterns:
+        # No change: no need to recompile patterns.
+        return
+
+    if not patterns:
+        func = None
+        # set_match_tests(None) behaves as set_match_tests(())
+        patterns = ()
+    elif all(map(_is_full_match_test, patterns)):
+        # Simple case: all patterns are full test identifier.
+        # The test.bisect utility only uses such full test identifiers.
+        func = set(patterns).__contains__
+    else:
+        regex = '|'.join(map(fnmatch.translate, patterns))
+        # The search *is* case sensitive on purpose:
+        # don't use flags=re.IGNORECASE
+        regex_match = re.compile(regex).match
+
+        def match_test_regex(test_id):
+            if regex_match(test_id):
+                # The regex matchs the whole identifier like
+                # 'test.test_os.FileTests.test_access'
                 return True
-    return False
+            else:
+                # Try to match parts of the test identifier.
+                # For example, split 'test.test_os.FileTests.test_access'
+                # into: 'test', 'test_os', 'FileTests' and 'test_access'.
+                return any(map(regex_match, test_id.split(".")))
+
+        func = match_test_regex
+
+    # Create a copy since patterns can be mutable and so modified later
+    _match_test_patterns = tuple(patterns)
+    _match_test_func = func
+
 
 
 def run_unittest(*classes):
@@ -1573,7 +1623,7 @@ def run_unittest(*classes):
             suite.addTest(cls)
         else:
             suite.addTest(unittest.makeSuite(cls))
-    _filter_suite(suite, _match_test)
+    _filter_suite(suite, match_test)
     _run_suite(suite)
 
 #=======================================================================

@@ -121,10 +121,15 @@ dircheck(PyFileObject* f)
 {
 #if defined(HAVE_FSTAT) && defined(S_IFDIR) && defined(EISDIR)
     struct stat buf;
+    int res;
     if (f->f_fp == NULL)
         return f;
-    if (fstat(fileno(f->f_fp), &buf) == 0 &&
-        S_ISDIR(buf.st_mode)) {
+
+    Py_BEGIN_ALLOW_THREADS
+    res = fstat(fileno(f->f_fp), &buf);
+    Py_END_ALLOW_THREADS
+
+    if (res == 0 && S_ISDIR(buf.st_mode)) {
         char *msg = strerror(EISDIR);
         PyObject *exc = PyObject_CallFunction(PyExc_IOError, "(isO)",
                                               EISDIR, msg, f->f_name);
@@ -430,7 +435,7 @@ close_the_file(PyFileObject *f)
             if (Py_REFCNT(f) > 0) {
                 PyErr_SetString(PyExc_IOError,
                     "close() called during concurrent "
-                    "operation on the same file object.");
+                    "operation on the same file object");
             } else {
                 /* This should not happen unless someone is
                  * carelessly playing with the PyFileObject
@@ -438,7 +443,7 @@ close_the_file(PyFileObject *f)
                  * pointer. */
                 PyErr_SetString(PyExc_SystemError,
                     "PyFileObject locking error in "
-                    "destructor (refcnt <= 0 at close).");
+                    "destructor (refcnt <= 0 at close)");
             }
             return NULL;
         }
@@ -686,6 +691,12 @@ typedef fpos_t Py_off_t;
 #error "Large file support, but neither off_t nor fpos_t is large enough."
 #endif
 
+#if defined(_MSC_VER) && _MSC_VER >= 1900
+#define HAVE_FSEEK64
+#define fseek64 _fseeki64
+#define HAVE_FTELL64
+#define ftell64 _ftelli64
+#endif
 
 /* a portable fseek() function
    return 0 on success, non-zero on failure (with errno set) */
@@ -762,6 +773,12 @@ file_seek(PyFileObject *f, PyObject *args)
 
     if (f->f_fp == NULL)
         return err_closed();
+    if (f->unlocked_count > 0) {
+        PyErr_SetString(PyExc_IOError,
+            "seek() called during concurrent "
+            "operation on the same file object");
+        return NULL;
+    }
     drop_readahead(f);
     whence = 0;
     if (!PyArg_ParseTuple(args, "O|i:seek", &offobj, &whence))
@@ -863,7 +880,16 @@ file_truncate(PyFileObject *f, PyObject *args)
     if (ret != 0)
         goto onioerror;
 
-#ifdef MS_WINDOWS
+#if defined(_MSC_VER) && _MSC_VER >= 1900
+    FILE_BEGIN_ALLOW_THREADS(f)
+    _Py_BEGIN_SUPPRESS_IPH
+    errno = 0;
+    ret = _chsize_s(_fileno(f->f_fp), newsize);
+    if (ret != 0)
+        goto onioerror;
+    _Py_END_SUPPRESS_IPH
+    FILE_END_ALLOW_THREADS(f)
+#elif defined(MS_WINDOWS)
     /* MS _chsize doesn't work if newsize doesn't fit in 32 bits,
        so don't even try using it. */
     {
@@ -1004,7 +1030,13 @@ new_buffersize(PyFileObject *f, size_t currentsize)
 #ifdef HAVE_FSTAT
     off_t pos, end;
     struct stat st;
-    if (fstat(fileno(f->f_fp), &st) == 0) {
+    int res;
+
+    Py_BEGIN_ALLOW_THREADS
+    res = fstat(fileno(f->f_fp), &st);
+    Py_END_ALLOW_THREADS
+
+    if (res == 0) {
         end = st.st_size;
         /* The following is not a bug: we really need to call lseek()
            *and* ftell().  The reason is that some stdio libraries
@@ -1015,7 +1047,11 @@ new_buffersize(PyFileObject *f, size_t currentsize)
            works.  We can't use the lseek() value either, because we
            need to take the amount of buffered data into account.
            (Yet another reason why stdio stinks. :-) */
+
+        Py_BEGIN_ALLOW_THREADS
         pos = lseek(fileno(f->f_fp), 0L, SEEK_CUR);
+        Py_END_ALLOW_THREADS
+
         if (pos >= 0) {
             pos = ftell(f->f_fp);
         }
@@ -1110,6 +1146,38 @@ file_read(PyFileObject *f, PyObject *args)
         }
         bytesread += chunksize;
         if (bytesread < buffersize && !interrupted) {
+#if defined(_MSC_VER) && _MSC_VER >= 1900
+            /* There seems to be a highly state dependant bug in the CRT stdio
+             * functions. Reading past the end of the file, so that the eof
+             * marker gets set, and then seeking back using SEEK_CUR causes a
+             * subsequent read() to return garbage data from its internal
+             * buffer. Setting the stream to unbuffered prevents this bug from
+             * happening, but we cannot do that, for obvious performance
+             * reasons. I have been unable to find a simple sequence of seek()
+             * + read() operations that cause this bug. It is triggered
+             * reliably by test_gzip.test_append_many.
+             *
+             * To workaround it we simply cause the CRT to discard its internal
+             * read buffer by rewinding the stream, and then seek back to the
+             * end. This has two performance downsides:
+             * 1) When subsequent seek+reads would have normally used the
+             * internal buffer, they cannot as the buffer has been discarded.
+             * 2) This procedure removes the eof marker, so a subsequent fread() will
+             * have to call the underlying read() instead of just using the eof marker.
+             * Hopefully, Microsoft will fix this eventually. Note, that if the
+             * stream is not seekable, no harm is done, since we call clearerr()
+             * afterwards, anyway.
+             */
+            _Py_BEGIN_SUPPRESS_IPH
+            if (feof(f->f_fp) != 0) {
+                /* Flush the underlying read buffer, while preserving stream
+                 * position. We have to use tell() because seeking to the end of
+                 * stream does not work for text mode streams. */
+                __int64 end_pos = _ftelli64(f->f_fp); 
+                if (end_pos > -1) { rewind(f->f_fp); _fseeki64(f->f_fp, end_pos, SEEK_SET); }
+            }
+            _Py_END_SUPPRESS_IPH
+#endif
             clearerr(f->f_fp);
             break;
         }
@@ -2238,6 +2306,7 @@ readahead(PyFileObject *f, Py_ssize_t bufsize)
 {
     Py_ssize_t chunksize;
 
+    assert(f->unlocked_count == 0);
     if (f->f_buf != NULL) {
         if( (f->f_bufend - f->f_bufptr) >= 1)
             return 0;
@@ -2279,6 +2348,12 @@ readahead_get_line_skip(PyFileObject *f, Py_ssize_t skip, Py_ssize_t bufsize)
     char *buf;
     Py_ssize_t len;
 
+    if (f->unlocked_count > 0) {
+        PyErr_SetString(PyExc_IOError,
+            "next() called during concurrent "
+            "operation on the same file object");
+        return NULL;
+    }
     if (f->f_buf == NULL)
         if (readahead(f, bufsize) < 0)
             return NULL;
@@ -2692,7 +2767,7 @@ int PyObject_AsFileDescriptor(PyObject *o)
     }
     else {
         PyErr_SetString(PyExc_TypeError,
-                        "argument must be an int, or have a fileno() method.");
+                        "argument must be an int, or have a fileno() method");
         return -1;
     }
 
